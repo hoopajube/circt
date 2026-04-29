@@ -68,7 +68,8 @@ class SourceFiles:
           so = p / f"lib{name}.so"
         return so if so.exists() else None
 
-      for path in Simulator.get_env().get("LD_LIBRARY_PATH", "").split(":"):
+      sep = ";" if os.name == "nt" else ":"
+      for path in Simulator.get_env().get("LD_LIBRARY_PATH", "").split(sep):
         p = check_path(Path(path))
         if p is not None:
           return p
@@ -109,13 +110,36 @@ class SimProcess:
   def force_stop(self):
     """Make sure to stop the simulation no matter what."""
     if self.proc:
-      os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
-      # Allow the simulation time to flush its outputs.
       try:
-        self.proc.wait(timeout=1.0)
-      except subprocess.TimeoutExpired:
-        # If the simulation doesn't exit of its own free will, kill it.
-        self.proc.kill()
+        if self.proc.poll() is not None:
+          # Process already exited.
+          pass
+        elif os.name == "nt":
+          # Use taskkill /T to kill the entire process tree.  Plain
+          # terminate() only kills the root process (vsim.exe) and leaves
+          # child processes like vsimk.exe orphaned.
+          subprocess.call(
+              ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+              stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL,
+          )
+        else:
+          os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+        # Allow the simulation time to flush its outputs.
+        try:
+          self.proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+          # If the simulation doesn't exit of its own free will, kill it.
+          if os.name == "nt":
+            subprocess.call(
+                ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+          else:
+            self.proc.kill()
+      except OSError:
+        pass
 
     # Join reader threads (they should exit once pipes are closed).
     for t in self.threads:
@@ -217,6 +241,14 @@ class Simulator:
         _thisdir.parent / "lib") + ":" + str(_thisdir.parent.parent / "lib")
     env["LD_LIBRARY_PATH"] = env.get("LD_LIBRARY_PATH", "") + ":" + str(
         _thisdir.parent / "lib") + ":" + str(_thisdir.parent.parent / "lib")
+
+    # On Windows, add the esiaccel package directory to PATH so that
+    # Questa can find transitive DLL dependencies (CosimRpc.dll, etc.)
+    # when loading the DPI shared library.
+    if os.name == "nt":
+      esiaccel_dir = str(_thisdir.parent)
+      env["PATH"] = esiaccel_dir + ";" + env.get("PATH", "")
+      
     return env
 
   def compile_commands(self) -> List[CompileStep]:
